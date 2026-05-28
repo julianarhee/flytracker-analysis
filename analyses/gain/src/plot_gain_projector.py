@@ -38,7 +38,7 @@ from datetime import datetime
 #print(today)
 #%%
 # Acquisition dir:
-acqdir = '/Volumes/Juliana/Caitlin_RA_data/Caitlin_projector'
+videodir = '/Volumes/Juliana/Caitlin_RA_data/Caitlin_projector'
 #has_meta_csv = True
 
 # Processed data directory (after running transform_data.py)
@@ -115,7 +115,7 @@ if create_aggregate:
     df_list = []; errs=[];
     for acq in all_acqs: #curracqs:
         try:
-            df_ = add_ft_actions(procdir, acqdir, acq, verbose=False)
+            df_ = add_ft_actions(procdir, videodir, acq, verbose=False)
 
             # Assign stimulus direction from meta
             currm = meta[meta['file_name']==acq]
@@ -157,7 +157,7 @@ if create_aggregate:
 #                            reassign_acquisition_name=True)
 
 #%%
-# errors - no actions:
+# errors - no actions (no courtship)
 '20250514-1051_fly1_Dyak-p1_5do_gh_2dR_ccw'
 '20250710-1505_fly1_Dyak-p1_3do_gh_2dR'
 '20250910-1338_fly3_Dyak-p1_5do_gh_2dR' 
@@ -181,11 +181,11 @@ f1.loc[(f1['stim_direction']=='CW') & (f1['targ_pos_theta']<0), 'pr_direction'] 
 #%%
 # Recompute ang_vel_fly from ori, fixing head-tail flips with discont=pi/2
 fps = 60
-f1['ang_vel_fly'] = f1.groupby('file_name')['ori'].transform(util.recompute_ang_vel, fps=fps)
+# f1['ang_vel_fly'] = f1.groupby('file_name')['ori'].transform(util.recompute_ang_vel, fps=fps)
 
-# NaN out head-tail flip frames (ori jumps > 90°) + 1 frame margin on each side
+# NaN out head-tail flip frames (ori jumps >= 180°) + 1 frame margin on each side
 ori_diff = f1.groupby('file_name')['ori'].diff().abs()
-flip_mask = ori_diff > np.pi / 2
+flip_mask = round(ori_diff) >= np.pi*0.9 #/ 2
 flip_mask = flip_mask | flip_mask.shift(1, fill_value=False) | flip_mask.shift(-1, fill_value=False)
 flips_per_file = f1.loc[flip_mask].groupby('file_name').size()
 flips_per_file = flips_per_file.reindex(f1['file_name'].unique(), fill_value=0)
@@ -193,17 +193,19 @@ frames_per_file = f1.groupby('file_name').size()
 pct_per_file = flips_per_file / frames_per_file * 100
 print(f"Head-tail flips per file: {flips_per_file.mean():.1f} +/- {flips_per_file.std():.1f} "
       f"({pct_per_file.mean():.2f} +/- {pct_per_file.std():.2f}% of frames per file)")
-f1.loc[flip_mask, ['ori', 'ang_vel_fly']] = np.nan
+# f1.loc[flip_mask, ['ori', 'ang_vel_fly']] = np.nan
 
 # Shift variables by lag of 200ms delay
-f1 = util.shift_variables_by_lag(f1, lag=12, file_grouper='file_name')
+f1 = util.shift_variables_by_lag(f1, lag=2, file_grouper='file_name')
+
+# Convert to deg and get abs
 f1['ang_vel_fly_shifted_abs'] = np.abs(f1['ang_vel_fly_shifted'])
 f1['ang_vel_fly_shifted_deg'] = np.rad2deg(f1['ang_vel_fly_shifted'])
 f1['ang_vel_fly_deg'] = np.rad2deg(f1['ang_vel_fly'])
-
+f1['theta_error_deg'] = np.rad2deg(f1['theta_error'])
 
 #%%
-f1['theta_error_deg'] = np.rad2deg(f1['theta_error'])
+# Bin by object position
 f1 = gf.bin_by_object_position(f1, start_bin=-180, end_bin=180, bin_size=20)
 f1['binned_theta_error_num'] = pd.to_numeric(f1['binned_theta_error'], errors='coerce')
 
@@ -212,8 +214,8 @@ f1.reset_index(drop=True, inplace=True)
 #%%
 filter_manual = False
 
-deg_lim = 90
-vel_lim = 5
+deg_lim = 180
+vel_lim = 10
 # filter chase
 if filter_manual:
     chasedf = f1[f1['chasing']==1].copy()
@@ -221,7 +223,7 @@ else:
     chasedf = f1[(f1['theta_error_deg']<deg_lim)
             & (f1['theta_error_deg']>-deg_lim)
             & (f1['vel']>vel_lim)
-            & (f1['max_wing_ang']>np.deg2rad(30))
+            #& (f1['max_wing_ang']>np.deg2rad(30))
             ].copy()
 
 # chase_str
@@ -233,7 +235,8 @@ chasedf.reset_index(drop=True, inplace=True)
 chasedf['binned_theta_error_num'] = pd.to_numeric(chasedf['binned_theta_error'], errors='coerce')
 
 #%%a
-# PLOT ALL
+# PLOT GAIN
+# ------------------------------------------------------------
 hue_var = 'pr_direction'
 pr_palette = {'progressive': 'darkgreen', 'regressive': 'purple'}
 cw_palette = {'CW': 'cyan', 'CCW': 'magenta'}
@@ -252,18 +255,19 @@ grouper = ['species', 'acquisition', 'binned_theta_error',
 #if assay == '38mm_projector':
 grouper.append(hue_var) 
 
-
 yvar = 'ang_vel_fly_shifted_deg'
-
+#import scipy.stats as spstats
 # Get average ang vel across individuals
-mean_no_levels = chasedf.groupby(grouper)[yvar].mean().reset_index()
+mean_chase = chasedf.groupby(grouper)[yvar].mean().reset_index()
+# Get circular mean of ang vel across groups
+
 #avg_ang_vel_no_levels = chase_.copy() #groupby(grouper)[yvar].mean().reset_index()
 err = 'se'
-print(mean_no_levels.groupby('species')['acquisition'].nunique())
+print(mean_chase.groupby('species')['acquisition'].nunique())
 
 fig, axn = plt.subplots(1, n_species, figsize=figsize,
                         sharex=True, sharey=True)
-for si, (sp, plotd) in enumerate(chasedf.groupby('species')):
+for si, (sp, plotd) in enumerate(mean_chase.groupby('species')):
     #plotd = avg_ang_vel[avg_ang_vel['species']=='Dyak'].copy()
     if n_species==1:
         ax=axn
@@ -314,12 +318,12 @@ for si, (sp, plotd) in enumerate(chasedf.groupby('species')):
     for side in ['left', 'right']:
         if side == 'left':
             plotd_ = plotd[plotd['binned_theta_error_num']<0]
-            mean_ = mean_no_levels[(mean_no_levels['species']==sp)
-                                & (mean_no_levels['binned_theta_error_num']<0)].copy()
+            mean_ = mean_chase[(mean_chase['species']==sp)
+                                & (mean_chase['binned_theta_error_num']<0)].copy()
         else:
             plotd_ = plotd[plotd['binned_theta_error_num']>0]   
-            mean_ = mean_no_levels[(mean_no_levels['species']==sp)
-                                & (mean_no_levels['binned_theta_error_num']>0)].copy()
+            mean_ = mean_chase[(mean_chase['species']==sp)
+                                & (mean_chase['binned_theta_error_num']>0)].copy()
         sns.lineplot(data=plotd_, 
                 x='binned_theta_error', y=yvar, ax=ax,
                 hue=hue_var, palette=stim_palette, 
@@ -463,7 +467,7 @@ fig2.savefig(os.path.join(save_example_dir, 'trajectory_2d.png'), dpi=150, bbox_
 
 #%%
 # ---- Figure 3: Video frame overlay ----
-video_path = os.path.join(acqdir, example_file)
+video_path = os.path.join(videodir, example_file)
 found_vid = util.find_video(video_path)
 
 if found_vid is not None:
