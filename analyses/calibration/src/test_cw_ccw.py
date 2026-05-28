@@ -17,6 +17,10 @@ import matplotlib.pyplot as plt
 
 import libs.utils as util
 import libs.plotting as putil
+import libs.stats as sutil
+
+from analyses.gain.src import gain_funcs as gf
+import transform_data.relative_metrics as rel
 
 #%%
 def infer_led_blocks(led_onset, n_LED_blocks, led_block_nframes, curr_leds):
@@ -347,23 +351,39 @@ putil.set_sns_style(plot_style, min_fontsize=min_fontsize)
 bg_color = [0.7]*3 if plot_style=='dark' else 'w'
 
 #%%
+# Set datapaths
 rootdir = '/Volumes/Juliana/Caitlin_RA_data/Caitlin_projector'
 
+videodir = '/Volumes/Juliana/Caitlin_RA_data/Caitlin_projector'
+processedmat_dir = '/Volumes/Juliana/2d_projector_analysis/circle_diffspeeds_calibrated/FlyTracker/processed_mats'
+basedir = os.path.split(processedmat_dir)[0]
+
+# Set figure dir
+figdir = os.path.join(basedir, 'calibrated')
+if not os.path.exists(figdir):
+    os.makedirs(figdir)
+print(figdir)
+
+# Load metadata
 meta_fpath = glob.glob(os.path.join(rootdir, '*.csv'))[0]
 meta0 = pd.read_csv(meta_fpath)
 meta0.head()
 
 #%
+protocol = '40s_10_120_prj5ms'
 # Get calibration data only
 meta = meta0[
       (meta0['tracked in matlab and checked for swaps']==1)
     #& (meta0['calibration']==1)
     # Check if '40s_10_120_prj5ms' in traj_in column values
-    & meta0['traj_in'].str.contains('40s_10_120_prj5ms')
+    & meta0['traj_in'].str.contains(protocol)
     & (meta0['speed_blocks_marked']==1)
     #& ~(meta0['led_onset_frame'].isna())
     ].copy()
 meta.shape
+
+figid = f'projector_{protocol}'
+print(figid)
 
 #%%
 conds = ['species_male', 'age_male', 'days_on_retinol', 'speeds', 'intensity_light']
@@ -409,7 +429,7 @@ speed_block_mode = 'annotated'
 
 # %%
 max_std_frames = 8 #10
-courtship_counts_all = []
+c_list = []
 errors = []
 missing_files = []
 for fn in meta['file_name'].unique():
@@ -493,9 +513,9 @@ for fn in meta['file_name'].unique():
     courtship_counts['led_intensity'] = led_intensity
     courtship_counts['stim_dir'] = stim_dir
    
-    courtship_counts_all.append(courtship_counts)
+    c_list.append(courtship_counts)
 
-courtship_counts_all = pd.concat(courtship_counts_all)
+courtship_counts_all = pd.concat(c_list)
 
 #%%
 print("Errors:")
@@ -512,12 +532,19 @@ courtship_counts_all.reset_index(drop=True, inplace=True)
 courtship_counts_all['date'] = [int(a.split('-')[0]) for a in courtship_counts_all['file_name']]
 # Find 'fly##' in file_name:
 courtship_counts_all['fly_num'] = [int(a.split('fly')[1].split('_')[0]) for a in courtship_counts_all['file_name']]
-courtship_counts_all['fly_id'] = [f'f{fnum}' for fnum in courtship_counts_all['fly_num']]
+courtship_counts_all['fly_id'] = [f'fly{fnum}' for fnum in courtship_counts_all['fly_num']]
 
 courtship_counts_all['acquisition'] = ['_'.join([str(a), b, c]) for a, b, c in courtship_counts_all[['date', 'fly_id', 'species']].values]
 
 #courtship_counts_all[['file_name', 'acquisition']]
 courtship_counts_all.groupby('species')['acquisition'].nunique()
+
+#%%
+# Save
+aggr_fpath = os.path.join(basedir, 'cw_ccw_calibrated_courtship_counts.parquet')
+courtship_counts_all.to_parquet(aggr_fpath)
+
+print(f"Saved aggregated courtship counts to: {aggr_fpath}")
 
 # %%
 # Get number of files for each age-ATR and include in legend
@@ -557,6 +584,11 @@ for i, (    cdir, cdf_) in enumerate(plotd.groupby('stim_dir')):
         frameon=False, title='', fontsize=10)  
 #plt.show()
 
+putil.label_figure(fig, figid)
+figname = 'frac_courtship_by_speed'
+#plt.savefig(os.path.join(figdir, f'{figname}.png'))
+#plt.savefig(os.path.join(figdir, f'{figname}.svg'))
+
 #%%
 # Check 0 speed:
 plotd = courtship_counts_all[courtship_counts_all['speed_hz']==0].copy()
@@ -572,11 +604,14 @@ ax.set_ylabel('Fraction courtship')
 sns.move_legend(ax, loc='upper left', bbox_to_anchor=(1, 1), 
     frameon=False, title='')  
 
+putil.label_figure(fig, figid)
+figname = 'frac_courtship_speed0'
+plt.savefig(os.path.join(figdir, f'{figname}.png'))
+#plt.savefig(os.path.join(figdir, f'{figname}.svg'))
 #%
 plotd[plotd['courtship_frac']>0.5]
 
 #%%
-
 # Look at distribution of fraction courtship for each acquisition
 plotd = courtship_counts_all.copy()
 fig, axn = plt.subplots(1, 2, figsize=(10, 5),
@@ -594,8 +629,12 @@ for i, (sp, df_) in enumerate(plotd.groupby('species')):
 sns.move_legend(ax, loc='upper left', bbox_to_anchor=(1, 1), 
     frameon=False, title='speed (mm/s)')  
 ax.set_ylabel('Fraction courtship')
-plt.show()
+#plt.show()
+figname = 'per_fly_courtship_split_speed'
+putil.label_figure(fig, figid)
+plt.savefig(os.path.join(figdir, f'{figname}.png'))
 
+# Box plot distribution
 plotd = courtship_counts_all.copy()
 fig, axn = plt.subplots(1, 2, figsize=(10, 5),
                         sharex=False, sharey=True)
@@ -609,50 +648,56 @@ for i, (sp, df_) in enumerate(plotd.groupby('species')):
     # Rotate x-ticks to be vertical
     ax.tick_params(axis='x', labelrotation=90)
     ax.set_ylabel('Fraction courtship')
-plt.show()
+
+putil.label_figure(fig, figid)
+figname = 'per_fly_courtship_boxplot'
+plt.savefig(os.path.join(figdir, f'{figname}.png'))
 
 #%%
 acquisition_parentdir = rootdir
 acqs = meta['file_name'].unique()
-processedmat_dir = os.path.join(rootdir, 'processedmat')
-create_new = True
-processedmat_dir = '/Volumes/Juliana/2d_projector_analysis/circle_diffspeeds_calibrated/FlyTracker/processed_mats'
+create_new = False
 
-from analyses.steering.src import gain_funcs as gf
-
-#%%
-# Transform data 
-df0_all, errors = gf.transform_projector_data(acquisition_parentdir, acqs,
-                                    processedmat_dir, movie_fmt='.avi',
-                                    subdir=None, flyid1=0, flyid2=1,
-                                    create_new=create_new, 
-                                    reassign_acquisition_name=True)
-
-
-#%%
-# Assign stimulus direction from meta
-for fn, df_ in df0_all.groupby('file_name'):
-    currm = meta[meta['file_name']==fn]
-    assert len(currm)>0, 'No meta data for {}'.format(fn)
-    assert len(currm)==1, 'Multiple meta data for {}'.format(fn)
-    stim_dir = currm['stim_direction'].unique()[0]
-    df0_all.loc[df0_all['file_name']==fn, 'stim_direction'] = stim_dir
+if not create_new:
+    df_list = []
+    for i, acq in enumerate(acqs):
+        if i%10==0:
+            print(f'Loading {i} of {len(acqs)}: {acq}')
+        df_ = rel.load_processed_df(processedmat_dir, acq, create_new=create_new)
+        assert 'pr_direction' in df_.columns, 'pr_direction not in df_.columns'
+        assert 'stim_direction' in df_.columns, 'stim_direction not in df_.columns'
+        df_list.append(df_)
+    df0_all = pd.concat(df_list)
+    print("Loaded all processed data")
 
 #%%
+if create_new:
+    # Transform data 
+    df0_all, errors = gf.transform_projector_data(acquisition_parentdir, acqs,
+                                        processedmat_dir, movie_fmt='.avi',
+                                        subdir=None, flyid1=0, flyid2=1,
+                                        create_new=create_new, 
+                                        reassign_acquisition_name=True)
+    #% Reset index for easier indexing
+    df0_all.reset_index(drop=True, inplace=True)
+
+    # Assign stimulus direction from meta
+    for fn, df_ in df0_all.groupby('file_name'):
+        df_ = gf.assign_stim_directions(df_, meta)
+
+        # Save df_ to processedmat_dir
+        df_.to_parquet(os.path.join(processedmat_dir, f'{fn}_df.parquet'))
+
+        # Overwrite original dataframe
+        df0_all.loc[df_.index] = df_
+
+
+#%%
+# ===============================================================
+# VF ANALYSES
+# ================================================================
 f1 = df0_all[df0_all['id']==0].copy()
-#%%
-# Assign "pr_direction" progressive or regressive:
-# stim_direction is CCW, and target_position < 0: progressive
-# stim_direciton is CCW, and target_position > 0: regressive
-# is CW and > 0: progressive
-# is CW and < 0: regressive
-f1['pr_direction'] = None
-f1.loc[(f1['stim_direction']=='ccw') & (f1['targ_pos_theta']<0), 'pr_direction'] = 'progressive'
-f1.loc[(f1['stim_direction']=='ccw') & (f1['targ_pos_theta']>0), 'pr_direction'] = 'regressive'
-f1.loc[(f1['stim_direction']=='cw') & (f1['targ_pos_theta']>0), 'pr_direction'] = 'progressive'
-f1.loc[(f1['stim_direction']=='cw') & (f1['targ_pos_theta']<0), 'pr_direction'] = 'regressive'
-
-#%%
+#%
 f1['ang_vel_abs'] = np.abs(f1['ang_vel'])
 f1 = util.shift_variables_by_lag(f1, file_grouper='file_name', lag=12)
 f1['ang_vel_fly_shifted_abs'] = np.abs(f1['ang_vel_fly_shifted'])
@@ -668,7 +713,7 @@ f1['binned_theta_error_num'] = pd.to_numeric(f1['binned_theta_error'], errors='c
 f1.reset_index(drop=True, inplace=True)
 
 #%%
-# 
+# Get average by fly
 # # Get average ang vel across bins
 grouper = ['species', 'acquisition', 'binned_theta_error',
           'binned_theta_error_num', 'pr_direction']
@@ -676,6 +721,8 @@ yvar = 'ang_vel_fly_shifted_deg'
 mean_f1 = f1.groupby(grouper)[yvar].mean().reset_index()
 
 #%%
+# GAIN PLOTS
+# ------------------------------------------------------------
 pr_palette = {'progressive': 'darkgreen', 'regressive': 'purple'}
 lw=2
 err = 'se'
@@ -711,290 +758,153 @@ sns.move_legend(ax, 'upper left', bbox_to_anchor=(1, 1),
 ax.set_xlim([-180, 180])
 ax.set_xticks(np.linspace(-180, 180, 9))
 
+putil.label_figure(fig, figid)
+figname = 'gain_species'
+plt.savefig(os.path.join(figdir, f'{figname}.png'))
+
 #%%
+# Distn of targets
+# ------------------------------------------------------------
+
+# from analyses.preprocessing.src.add_ft_actions import add_ft_actions
+
+#%%
+df_list = []
+for currf, df_ in df0_all.groupby('file_name'):
+    #df_ = df0_all[df0_all['file_name']==currf].copy()
+    actions_fpath = os.path.join(videodir, currf, currf, f'{currf}-actions.mat')
+    assert os.path.exists(actions_fpath), f'File {actions_fpath} does not exist'
+
+    # Load actions
+    actions = util.load_ft_actions([actions_fpath], split_end=False)
+    df_ = util.assign_action_frames_to_df(df_, actions)
+
+    df_list.append(df_)
+
+df0_all = pd.concat(df_list)
 
 # %%
-# Split by speed and age-ATR
-g = sns.FacetGrid(courtship_counts_all, 
-        col='speed_hz', row='age-ATR')
-g.map_dataframe(sns.lineplot, x='led_intensity', y='courtship_frac',
-                hue='species', palette=species_palette)
-g.add_legend()
-#%%
+fig, ax = plt.subplots(figsize=(5, 5))
+f1 = df0_all[df0_all['id']==0].copy()
 
-sp = 'Dyak'
-yak_ages = ['3-3.0', '4-4.0', '5-5.0']
-all_speeds = courtship_counts_all['speed_hz'].unique()
-print(all_speeds)
-speed_palette = dict(zip(sorted(all_speeds), sns.color_palette('viridis', n_colors=len(all_speeds))))
+# Get df for curr file
+crt_df = f1[(f1['courtship']==True)].copy()
 
-yakd = courtship_counts_all[
-    (courtship_counts_all['species']=='Dyak')].copy()
-
-#%%
-sp = 'Dmel'
-mel_ages = ['3-0.5', '3-1.0']
-led_type = 'low_led'
-mel = courtship_counts_all[
-        (courtship_counts_all['species']=='Dmel')
-      & (courtship_counts_all['led_type']==led_type)].copy()
-tmp_mel = courtship_counts_all[
-    (courtship_counts_all['species']=='Dmel') &
-    (courtship_counts_all['age-ATR']=='2-0.5')].copy()
-# Combine
-mel = pd.concat([mel, tmp_mel])
-mel_ages.append('2-0.5')
-mel_ages = sorted(mel_ages)
-
-#%%
-# Average speed hz
-# ------
-sp = 'Dyak'
-yakd = courtship_counts_all[
-    (courtship_counts_all['species']==sp)].copy()
-fig, axn = plt.subplots(1, 3, sharex=True, sharey=True, figsize=(10, 5))
-for i, age_atr in enumerate(yak_ages):
-    plotd = yakd[yakd['age-ATR']==age_atr].copy()
-    # plot
-    #for speed_, df_ in plotd.groupby('speed_type'):
-    #ri = 0 if speed_ == 'slow_speed' else 1
-    ax=axn[i]
-    sns.lineplot(data=plotd, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        hue='speed_hz', palette=speed_palette, 
-        legend=0)
-    ax.set_title(f'{sp} {age_atr}', fontsize=12)
-    ax.set_box_aspect(1)
-    # plot all the xtick labels
-    xtick_labels = yakd['led_intensity'].unique()
-    ax.set_xticks(xtick_labels)
-    ax.set_xticklabels(xtick_labels, fontsize=10)
-#Custom legend for speed_hz
-legend_handles = [mpl.lines.Line2D([0], [0], color=speed_palette[s], lw=4) for s in sorted(all_speeds)]
-legend_labels = [f'{s} Hz' for s in sorted(all_speeds)]
-plt.legend(legend_handles, legend_labels, loc='lower left', bbox_to_anchor=(1, 1), 
-    frameon=False, title='')  
-
-#%%
-# Dmel
-sp = 'Dmel'
-#ages = ['3-0.5', '3-1.0']
-led_type = 'low_led'
-mel_ages = sorted(mel_ages)
-# plot
-fig, axn = plt.subplots(1, 3, sharex=False, sharey=True, figsize=(10, 5))
-for i, age_atr in enumerate(mel_ages):
-    plotd = mel[mel['age-ATR']==age_atr].copy()
-    # plot
-    #ri = 0 if speed_ == 'slow_speed' else 1
-    ax=axn[i]
-    print(plotd['led_intensity'].unique())
-    sns.lineplot(data=plotd, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        hue='speed_hz', palette=speed_palette, 
-        legend=0)#legend=(i==2) & (ri==1))
-    ax.set_title(f'{sp} {age_atr}', fontsize=12)
-    ax.set_box_aspect(1)
-    # plot all the xtick labels
-    xtick_labels = plotd['led_intensity'].unique()
-    ax.set_xticks(xtick_labels)
-    ax.set_xticklabels(xtick_labels, fontsize=10)
-
-#Custom legend for speed_hz
-legend_handles = [mpl.lines.Line2D([0], [0], color=speed_palette[s], lw=4) for s in sorted(all_speeds)]
-legend_labels = [f'{s} Hz' for s in sorted(all_speeds)]
-plt.legend(legend_handles, legend_labels, loc='lower left', bbox_to_anchor=(1, 1), 
-    frameon=False, title='')  
-plt.subplots_adjust(hspace=0.5)
-sns.move_legend(ax, loc='lower left', bbox_to_anchor=(1, 1), 
-    frameon=False, title='')  
-
-#%%
-# DONT split by speed:
-# ------
-sp = 'Dmel'
-mel_ages = ['3-0.5', '3-1.0']
-led_type = 'low_led'
-mel = courtship_counts_all[
-        (courtship_counts_all['species']=='Dmel')
-      & (courtship_counts_all['led_type']==led_type)].copy()
-mel_ages = sorted(mel['age-ATR'].unique())
-#sp = 'Dmel'
-#ages = ['3-0.5', '3-1.0']
-#led_type = 'low_led'
-#mel_ages = sorted(mel_ages)
-# plot
-fig, axn = plt.subplots(1, 2, sharex=False, sharey=True, figsize=(10, 5))
-for i, age_atr in enumerate(mel_ages):
-    plotd = mel[mel['age-ATR']==age_atr].copy()
-    # plot
-    #ri = 0 if speed_ == 'slow_speed' else 1
-    ax=axn[i]
-    print(plotd['led_intensity'].unique())
-    sns.lineplot(data=plotd, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        #hue='speed_hz', palette=speed_palette, 
-        legend=0)#legend=(i==2) & (ri==1))
-    ax.set_title(f'{sp} {age_atr}', fontsize=12)
-    ax.set_box_aspect(1)
-    # plot all the xtick labels
-    xtick_labels = plotd['led_intensity'].unique()
-    ax.set_xticks(xtick_labels)
-    ax.set_xticklabels(xtick_labels, fontsize=10)
-    ax.axvline(x=3, color=bg_color, linestyle='--')
-# Do yak now
-sp = 'Dyak'
-fig, axn = plt.subplots(1, 3, sharex=True, sharey=True, figsize=(10, 5))
-for i, age_atr in enumerate(yak_ages):
-    plotd = yakd[yakd['age-ATR']==age_atr].copy()
-    # plot
-    #for speed_, df_ in plotd.groupby('speed_type'):
-    #ri = 0 if speed_ == 'slow_speed' else 1
-    ax=axn[i]
-    sns.lineplot(data=plotd, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        #hue='speed_hz', palette=speed_palette, 
-        legend=0)#legend=(i==2) & (ri==1))
-    ax.set_title(f'{sp} {age_atr}', fontsize=12)
-    ax.set_box_aspect(1)
-    # plot all the xtick labels
-    xtick_labels = plotd['led_intensity'].unique()
-    ax.set_xticks(xtick_labels)
-    ax.set_xticklabels(xtick_labels, fontsize=10)
-    #ax.axvline(x=3, color=bg_color, linestyle='--')
-    # Plot line
-    ax.axvline(x=20, color=bg_color, linestyle='--')
-#%%
-
-plotd = courtship_counts_all[
-    (courtship_counts_all['species']=='Dyak')
-    & (courtship_counts_all['age-ATR']=='5-5.0')].copy()
-
-#fig, axn = plt.subplots(2, 3, sharex=True, sharey=True, figsize=(10, 5))
-n_speeds = plotd['speed_hz'].nunique()
-#speed_palette = dict(zip(sorted(plotd['speed_hz'].unique()), sns.color_palette('viridis', n_colors=n_speeds)))
-file_palette = dict(zip(sorted(plotd['file_name'].unique()), sns.color_palette('colorblind', n_colors=len(plotd['file_name'].unique()))))
-fig, axn = plt.subplots(n_speeds, 1, 
-            sharex=True, sharey=True, figsize=(10, 10))
-for i, (speed_, df_) in enumerate(plotd.groupby('speed_hz')):
-    ax=axn[i]
-    sns.lineplot(data=df_, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        hue='file_name', palette=file_palette, #palette=speed_palette, 
-        legend=i==0)
-    ax.set_title(f'{speed_}')
-    ax.set_box_aspect(1)
-
-#%%
-fn = '20260415-1606_fly10_Dyak-p1_5do_gh_5dR'
-plotd = courtship_counts_all[
-    (courtship_counts_all['species']=='Dyak')
-    & (courtship_counts_all['file_name']==fn)].copy()
-print(plotd.shape)
-
-fig, ax = plt.subplots(figsize=(10, 5))
-sns.lineplot(data=plotd, ax=ax,
-    x='led_intensity', y='courtship_frac',
-    hue='speed_hz', palette='viridis', legend=1)
-ax.set_title(f'{fn}')
-ax.set_box_aspect(1)
-
-#%%
-for age_atr in ages:
-    plotd = mel[mel['age-ATR']==age_atr].copy()
-    # plot
-    ax=axn[i]
-    sns.lineplot(data=plotd, ax=ax,
-        x='led_intensity', y='courtship_frac',
-        hue='speed_hz', palette='viridis', legend=i==2)
-# %%
-
-#%%
-#conds = ['led_type', 'speed_type']
-f = sns.FacetGrid(courtship_counts_all, 
-row='led_type', col='speed_hz')
-f.map_dataframe(sns.lineplot, 
-            x='led_intensity', y='courtship_frac', 
-            style='age-ATR', hue='species', 
-            palette=species_palette)
-f.add_legend()
-
-
-#%%
-xvar = 'led_level'
-mel_led_type = 'low_led'
-yak_led_type = 'full_led'
-
-mel = courtship_counts_all[
-    (courtship_counts_all['species']=='Dmel') &
-    (courtship_counts_all['led_type']==mel_led_type)].copy()
-
-yak = courtship_counts_all[
-    (courtship_counts_all['species']=='Dyak') &
-    (courtship_counts_all['led_type']==yak_led_type)].copy()
-
-#for age_str, age_df in courtship_counts_all.groupby('age-ATR'):
-#fig, ax = plt.subplots(figsize=(10, 5))
-# Combine mel unique speed_hz and yak unique speed_hz
-unique_speed_hz = sorted(list(set(mel['speed_hz'].unique()) | set(yak['speed_hz'].unique())))
-
-
-#g = sns.FacetGrid(courtship_counts_all, col='speed_hz')
-fig, axn = plt.subplots(len(unique_speed_hz), 1, 
-            sharex=True, sharey=True, figsize=(4, 12))
-fig.text(0.02, 0.95, f'mel: {mel_led_type}, yak: {yak_led_type}', fontsize=12)
-for i, speed_hz in enumerate(unique_speed_hz):
-    for sp, df_ in [('Dmel', mel), ('Dyak', yak)]:
-        ax=axn[i]
-        sns.lineplot(data=df_[df_['speed_hz']==speed_hz], 
-                    ax=ax,
-                    x=xvar, y='courtship_frac',
-                    hue='species', style='age-ATR',
-                    palette=species_palette,
-                    legend=i==len(unique_speed_hz)-1)
-        ax.set_title(f'speed: {speed_hz} Hz', loc='left')
-#ax.set_box_aspect(1)
-#ax.set_ylim([0, 1])
-plt.subplots_adjust(hspace=0.5)
-sns.move_legend(ax, loc='lower left', bbox_to_anchor=(1, 1), 
-    frameon=False, title='')  
-# %
-print(mel.groupby('age-ATR')['file_name'].nunique()) # )
-print(yak.groupby('age-ATR')['file_name'].nunique()) # 4
-# Dmel:
-# age-ATR
-# 3-1.0    4
-
-# Dyak:
-# age-ATR
-# 3-3.0    4
-# 4-4.0    3
-#%
-#%% 
-# Combine mel and yak df
-comb = pd.concat([mel, yak])
-comb.shape
-
-# Get speeds where courtship level is min. > 0.4
-# for a given LED level
-min_frac = 0.5
-mean_frac = comb.groupby(['species', 'speed_hz', 'led_intensity', 'age-ATR'],
-                        as_index=False)['courtship_frac'].mean()
-means_above_thr = mean_frac[mean_frac['courtship_frac']>=min_frac]
-
-# %%
-#comb[(comb['species']=='Dyak') & (comb['speed_hz']==20)].\
-#    groupby('led_level')['courtship_frac'].mean()
-# Plot best match?
-incl_speeds = means_above_thr['speed_hz'].unique().tolist() #[40, 60 80]
-plotd = comb[comb['speed_hz'].isin(incl_speeds)]
-
-fig, ax = plt.subplots()
-sns.lineplot(data=plotd, ax=ax,
-            x='led_intensity', y='courtship_frac',
-            hue='species', palette=species_palette)
-ax.set_title('Courtship by LED and speed')
-ax.set_xlabel('LED intensity')
-ax.set_ylabel('Courtship frames')
+# Plot
+sns.histplot(data=crt_df, ax=ax,
+            x= 'targ_pos_theta',
+            hue='species', palette=species_palette,
+            bins=100, kde=True, 
+            stat='probability', common_norm=False)
+ax.set_xlabel('Target position (deg)')
+ax.set_ylabel('Count')
 plt.show()
+
+#%%
+# Plot sparse distribution of target position as scatterplot on polar plot
+# ------------------------------------------------------------
+for i, plot_type in enumerate(['polar', 'scatter']):
+    if plot_type == 'polar':
+        fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})
+        markersize = 20
+    else:
+        fig, ax = plt.subplots(figsize=(5, 5))
+        markersize = 30
+    sns.scatterplot(data=crt_df, ax=ax,
+                x='targ_pos_theta', y='targ_pos_radius',
+                hue='species', palette=species_palette, 
+                alpha=0.1, s=markersize, edgecolor='none')
+    # if polar, set theta_zero_location to N
+    if plot_type == 'polar':
+        ax.set_theta_zero_location('N')
+        ax.set_theta_direction(-1)
+    sns.move_legend(ax, loc='upper left', bbox_to_anchor=(1, 1), 
+                    frameon=False, title='', fontsize=min_fontsize)  
+    putil.label_figure(fig, figid)
+    figname = f'targ_pos_{plot_type}'
+    plt.savefig(os.path.join(figdir, f'{figname}.png'))
+
+# # For each acquisition, plot box plot of target position
+# fig, axn = plt.subplots(1, 2, figsize=(10, 5), 
+#                         sharex=True, sharey=True)
+# 
+# for i, (sp, spdf) in enumerate(df0_all.groupby('species')):
+#     ax=axn[i]
+#     sns.boxplot(data=spdf, ax=ax,
+#                 x='acquisition', y='targ_pos_theta',
+#                 color=bg_color)
+#                 #hue='species', palette=species_palette)
+#     ax.set_title(f'{sp}')
+#     # Rotate x-ticks to be vertical
+#     ax.tick_params(axis='x', labelrotation=90)
+#     ax.set_xlabel('Acquisition')
+#     ax.set_ylabel('Target position (deg)')
+
+
+#%%
+# Fraction of courtship frames in frontal and lateral VF
+# ------------------------------------------------------------
+import scipy.stats as spstats
+
+frontal_deg = 25 #= np.deg2rad(30)
+lateral_deg = 45 #= np.deg2rad(50)
+
+# Assign targ_pos_theta to vf_position, frontal or lateral
+f1['vf_position'] = np.nan
+f1.loc[f1['targ_pos_theta'] < np.deg2rad(frontal_deg), 'vf_position'] = 'frontal'
+f1.loc[f1['targ_pos_theta'] >= np.deg2rad(lateral_deg), 'vf_position'] = 'lateral'
+
+#%
+# Plot N of frames in each vf_position for each species
+crt = f1[(f1['courtship']==True)].copy()
+
+# Get fraction of frames in each vf_position for each acquisition
+vf_position_frac = crt.groupby(['species', 'acquisition', 'vf_position'])['frame'].count() / crt.groupby('acquisition')['frame'].count()
+vf_position_frac = vf_position_frac.reset_index()
+vf_position_frac.columns = ['species', 'acquisition', 'vf_position', 'fraction']
+
+# Plot distribution of fraction of frames in each vf_position for each acquisition
+fig, axn = plt.subplots(1, 2, figsize=(5, 3))
+for i, (vf, vf_df) in enumerate(vf_position_frac.groupby('vf_position')):
+    ax=axn[i]
+    sns.barplot(data=vf_df, ax=ax,
+                x='species', y='fraction',
+                hue='species', palette=species_palette,
+                fill=False) # width=bar_width)
+    ax.legend_.remove()
+    sns.stripplot(data=vf_df, ax=ax,
+                x='species', y='fraction',
+                hue='species', palette=species_palette,
+                legend=0)
+    ax.set_xlabel('')
+
+    # title
+    if vf == 'frontal':
+        ax.set_title(f'Frontal: targ. <= {frontal_deg} deg')
+    elif vf == 'lateral':
+        ax.set_title(f'Lateral: targ. >= {lateral_deg} deg')
+
+    # Do stats to test for species difference
+    res = spstats.mannwhitneyu(vf_df[vf_df['species']=='Dmel']['fraction'],
+                               vf_df[vf_df['species']=='Dyak']['fraction'])
+    print(f'{vf}: {res.pvalue}')
+    putil.annotate_axis(ax, sutil.pval_to_stars(res.pvalue),
+                        color=bg_color, fontsize=min_fontsize+2)
+
+    # Set y-tick labels
+    max_y = round(vf_df['fraction'].max(), 1)
+    n_ticks = 4 if max_y%0.2==0 else 5    
+    ax.set_yticks(np.linspace(0, max_y+0.1, n_ticks))
+    ax.set_ylabel('Fraction of courtship frames')
+    ax.set_xlabel('')
+    sns.despine(offset=4, trim=True, bottom=True)
+
+    ax.set_box_aspect(2)
+
+plt.subplots_adjust(hspace=0.8)
+
+putil.label_figure(fig, figid)
+figname = 'vf_position_frac_courtship'
+plt.savefig(os.path.join(figdir, f'{figname}.png'))
+plt.savefig(os.path.join(figdir, f'{figname}.svg'))
 # %%
