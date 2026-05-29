@@ -170,6 +170,46 @@ def assign_progressive_regressive_from_cw_ccw(df_, stim_direction_var='stim_dire
 
     return df_
 
+def assign_progressive_regressive_from_velocity(df_, theta_var='targ_pos_theta',
+                                                 ang_vel_var='targ_ang_vel',
+                                                 file_grouper='file_name'):
+    """
+    Assign progressive/regressive based on instantaneous target motion
+    relative to the male's midline, independent of CW/CCW stimulus direction.
+
+    Progressive: target moving away from midline (|theta| increasing).
+    Regressive:  target moving toward midline (|theta| decreasing).
+
+    The sign is determined by theta * angular_velocity:
+      > 0 → target and its velocity point in the same direction → moving away
+      < 0 → target and its velocity point in opposite directions → moving toward
+
+    Parameters
+    ----------
+    df_ : pd.DataFrame
+        Must contain theta_var and ang_vel_var columns.
+    theta_var : str
+        Egocentric target angle (rad, signed).
+    ang_vel_var : str
+        Angular velocity of the target (rad/s, signed).
+    file_grouper : str
+        Column that identifies separate sessions (unused here but kept for
+        API consistency with shift-based functions).
+
+    Returns
+    -------
+    pd.DataFrame
+        Input with added 'pr_direction' column ('progressive' or 'regressive').
+    """
+    df_ = df_.copy()
+    # theta * ang_vel > 0  →  same sign  →  moving away from midline
+    product = df_[theta_var] * df_[ang_vel_var]
+    df_['pr_direction'] = None
+    df_.loc[product > 0, 'pr_direction'] = 'progressive'
+    df_.loc[product < 0, 'pr_direction'] = 'regressive'
+    return df_
+
+
 def load_transformed_data(parquet_path):
     """Thin wrapper: derive acqdir/savedir from a parquet path, delegate to rel.load_processed_df."""
     savedir = os.path.dirname(parquet_path)
