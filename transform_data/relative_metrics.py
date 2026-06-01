@@ -390,8 +390,8 @@ def calculate_theta_error_from_heading(f1, f2, xvar='pos_x', yvar='pos_y'):
     #th_err = [util.set_angle_range_to_neg_pos_pi(v) for v in th_err]
     #th_err[0] = th_err[1]
     f1['theta_error_heading'] = th_err
-    f1['theta_error_heading_dt'] = pd.Series(np.unwrap(f1['theta_error'].interpolate().ffill().bfill())).diff() / f1['sec'].diff().mean()
-    f1['theta_error_heading_deg'] = np.rad2deg(f1['theta_error'])
+    f1['theta_error_heading_dt'] = pd.Series(np.unwrap(f1['theta_error_heading'].interpolate().ffill().bfill())).diff() / f1['sec'].diff().mean()
+    f1['theta_error_heading_deg'] = np.rad2deg(f1['theta_error_heading'])
 
     return f1
 

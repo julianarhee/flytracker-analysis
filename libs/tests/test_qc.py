@@ -190,6 +190,79 @@ def test_nan_flipped_orientation_per_id_preserves_index():
 
 
 # ---------------------------------------------------------------------------
+# resolve_orientation (method dispatch)
+# ---------------------------------------------------------------------------
+def test_resolve_orientation_velocity_nans_flipped_chunk():
+    df = _walking_fly([0.0, np.pi, 0.0])
+    out, info = qc.resolve_orientation(df, method='velocity', fps=60, min_moving_frames=5)
+    assert info['method'] == 'velocity'
+    assert info['per_fly'] is not None
+    # The backward middle third is NaN'd; ends kept.
+    o = out.sort_values('frame')['ori'].values
+    assert np.isnan(o[10:20]).all()
+    assert np.isfinite(o[:10]).all() and np.isfinite(o[20:]).all()
+
+
+def test_resolve_orientation_wing_nans_wingless_frames():
+    n = 10
+    df = pd.DataFrame({
+        'id': 0, 'frame': np.arange(n), 'pos_x': np.arange(n) * 5.0,
+        'pos_y': np.zeros(n), 'ori': np.zeros(n),
+        'wing_l_x': np.r_[np.nan * np.ones(4), np.arange(6)],
+        'wing_l_y': np.r_[np.nan * np.ones(4), np.arange(6)],
+        'wing_r_x': np.r_[np.nan * np.ones(4), np.arange(6)],
+        'wing_r_y': np.r_[np.nan * np.ones(4), np.arange(6)],
+    })
+    out, info = qc.resolve_orientation(df, method='wing')
+    assert info['method'] == 'wing'
+    assert out['ori'].iloc[:4].isna().all()   # no wing info -> NaN
+    assert out['ori'].iloc[4:].notna().all()
+
+
+def test_resolve_orientation_none_keeps_everything():
+    df = _walking_fly([0.0, np.pi, 0.0])
+    out, info = qc.resolve_orientation(df, method='none')
+    assert info['method'] == 'none'
+    assert info['frac_ori_nan'] == 0.0
+    assert out['ori'].notna().all()
+
+
+def test_resolve_orientation_bad_method_raises():
+    df = _walking_fly([0.0])
+    with pytest.raises(ValueError):
+        qc.resolve_orientation(df, method='magnets')
+
+
+# ---------------------------------------------------------------------------
+# plot_theta_error_ori_vs_heading
+# ---------------------------------------------------------------------------
+def test_plot_theta_error_ori_vs_heading_returns_r():
+    rng = np.random.default_rng(0)
+    ori = rng.uniform(-np.pi, np.pi, 500)
+    df = pd.DataFrame({'theta_error': ori,
+                       'theta_error_heading': ori + rng.normal(0, 0.05, 500)})
+    fig, r = qc.plot_theta_error_ori_vs_heading(df)
+    assert fig is not None
+    assert r > 0.9  # strongly correlated by construction
+
+
+def test_plot_theta_error_ori_vs_heading_missing_col():
+    df = pd.DataFrame({'theta_error': [0.1, 0.2, 0.3]})
+    fig, r = qc.plot_theta_error_ori_vs_heading(df)
+    assert fig is None and np.isnan(r)
+
+
+def test_recompute_theta_error_heading_matches_circular_distance():
+    import libs.utils as util
+    df = pd.DataFrame({'abs_ang_between': [0.5, -2.0, 3.0, 0.0],
+                       'heading': [0.1, 1.0, -3.0, np.pi]})
+    out = qc.recompute_theta_error_heading(df)
+    expected = util.circular_distance(df['abs_ang_between'], df['heading'])
+    assert np.allclose(out, expected)
+    assert np.all(np.abs(out) <= np.pi + 1e-9)  # wrapped to [-pi, pi]
+
+
+# ---------------------------------------------------------------------------
 # save_bout_video (headless smoke test)
 # ---------------------------------------------------------------------------
 def test_save_bout_video_writes_file(tmp_path):

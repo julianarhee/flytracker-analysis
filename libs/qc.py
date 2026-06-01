@@ -257,6 +257,100 @@ def exclude_flipped_orientation(flydf, cols=('ori',), fps=60, **kwargs):
     return df, summary
 
 
+# Orientation head/tail-polarity handling methods, shared across FlyTracker
+# analyses (see `resolve_orientation`).
+ORI_METHODS = ('velocity', 'wing', 'none')
+WING_COLS = ('wing_l_x', 'wing_l_y', 'wing_r_x', 'wing_r_y')
+
+
+def resolve_orientation(trk, method='velocity', fps=60, id_col='id',
+                        wing_cols=WING_COLS, verbose=False, **kwargs):
+    """Apply head/tail orientation-polarity handling to RAW FlyTracker tracking.
+
+    This is the shared entry point for deciding how much to trust FlyTracker's
+    body-axis orientation. It is generic to *any* FlyTracker dataset, not just
+    the 2x2 strain assay: call it on freshly loaded tracking
+    (`load_flytracker_data(..., filter_ori=False)`, `ori` NOT yet negated),
+    BEFORE the `ori = -1*ori` convention flip and the relative-metrics transform.
+
+    Methods
+    -------
+    'velocity' (default):
+        Keep FlyTracker's body-axis `ori` and NaN only the chunks whose
+        orientation is anti-aligned with the direction of motion — a genuine
+        head-tail flip — per fly (via `nan_flipped_orientation_per_id`).
+        Assumes the fly translates *forward*, not backward or sideways. This
+        holds well for walking/chasing flies (a courting male does not chase by
+        walking backward) and recovers wing-missing-but-correctly-oriented
+        frames that 'wing' discards.
+    'wing':
+        The conservative legacy rule — NaN `ori` wherever FlyTracker did not
+        detect wings (all `wing_cols` NaN; equivalent to
+        `load_flytracker_data(filter_ori=True)`). Makes NO motion assumption,
+        but discards many valid frames, and its data loss is behaviour-correlated
+        (wing detection tracks wing extension / song), which can bias
+        orientation-based metrics.
+    'none':
+        Trust FlyTracker's raw `ori` unchanged (no filtering, no flip
+        resolution). Makes no assumptions; keeps everything.
+
+    Choosing a method
+    -----------------
+    'velocity' is the right default for courtship / pursuit assays where the
+    focal fly walks toward its target. Prefer 'wing' or 'none' for assays with
+    substantial **sideways or backward** motion, where the forward-motion
+    assumption is weak and 'velocity' could mislabel a chunk.
+
+    A future MIDDLE-GROUND option could keep 'velocity' but ignore
+    near-perpendicular (sideways) frames when scoring each chunk's alignment, so
+    occasional sideways motion does not influence the call while real flips are
+    still caught. It is intentionally NOT implemented yet: the per-chunk *mean*
+    alignment already down-weights sporadic sideways frames (cos ~ 0), so the
+    extra knob only helps when a chunk is *predominantly* sideways — we add it
+    when that case is actually observed in data, rather than speculatively.
+
+    Args:
+        trk: raw FlyTracker tracking df (needs `ori`; 'velocity' also needs
+            `frame`, `pos_x`, `pos_y`; 'wing' needs the `wing_cols`).
+        method: one of `ORI_METHODS`.
+        fps, id_col, **kwargs: forwarded to `nan_flipped_orientation_per_id`
+            for the 'velocity' method.
+        wing_cols: wing columns whose joint absence defines "no wing info".
+        verbose: print a one-line summary of how much `ori` was NaN'd.
+
+    Returns:
+        (trk, info) — `trk` with `ori` NaN'd per the method; `info` dict with
+        keys 'method', 'frac_ori_nan', and (velocity only) 'per_fly' flip
+        summaries.
+    """
+    if method not in ORI_METHODS:
+        raise ValueError("method must be one of {}, got {!r}".format(ORI_METHODS, method))
+    trk = trk.copy()
+    info = {'method': method, 'per_fly': None}
+    n_before = int(trk['ori'].notna().sum())
+
+    if method == 'velocity':
+        trk, summaries = nan_flipped_orientation_per_id(
+            trk, id_col=id_col, cols=('ori',), fps=fps, **kwargs)
+        info['per_fly'] = summaries
+    elif method == 'wing':
+        have = [c for c in wing_cols if c in trk.columns]
+        if len(have) == len(wing_cols):
+            no_wing = trk[list(wing_cols)].isna().sum(axis=1) == len(wing_cols)
+            trk.loc[no_wing, 'ori'] = np.nan
+        elif verbose:
+            print("resolve_orientation('wing'): wing columns {} missing; ori unchanged"
+                  .format([c for c in wing_cols if c not in trk.columns]))
+    # 'none': leave ori as-is.
+
+    n_after = int(trk['ori'].notna().sum())
+    info['frac_ori_nan'] = float(1 - n_after / n_before) if n_before else 0.0
+    if verbose:
+        print("resolve_orientation(method={}): NaN'd {:.2%} of valid-ori frames".format(
+            method, info['frac_ori_nan']))
+    return trk, info
+
+
 def nan_flipped_orientation_per_id(df, id_col='id', cols=('ori',), fps=60, **kwargs):
     """Per fly id, resolve head-tail flip chunks (velocity-based) and NaN `cols`
     on flipped chunks, preserving the original index and row order.
@@ -416,6 +510,97 @@ def plot_flip_montage(acqdir, fly_id=None, f_start=None, n_frames=20,
 
     return {'fly_id': fly_id, 'f_start': f_start, 'n_flips': n_flips,
             'fig': fig, 'savepath': savepath, 'flip_summary': flip_summary}
+
+
+# ---------------------------------------------------------------------------
+# QC: theta_error from orientation vs from heading
+# ---------------------------------------------------------------------------
+def recompute_theta_error_heading(df, los_col='abs_ang_between', heading_col='heading'):
+    """Recompute heading-based theta_error from the stored line-of-sight angle
+    and heading: a one-liner you can apply to an existing (processed) df.
+
+        df['theta_error_heading'] = qc.recompute_theta_error_heading(df)
+        # equivalently: util.circular_distance(df['abs_ang_between'], df['heading'])
+
+    Returns the heading-based theta_error as a Series (radians).
+    """
+    return util.circular_distance(df[los_col], df[heading_col])
+
+
+def plot_theta_error_ori_vs_heading(df, ori_col='theta_error',
+                                    heading_col='theta_error_heading',
+                                    in_degrees=True, lim=180, title=None,
+                                    rasterized=True):
+    """Compare the orientation-based vs heading-based theta_error for a dataset.
+
+    `theta_error` (the analysis default) is measured from the fly's body-axis
+    **orientation**; `theta_error_heading` is measured from its **heading**
+    (direction of motion). They diverge when the fly sideslips. This QC scatters
+    one against the other (with a unity line + Pearson r) and shows the
+    difference distribution — a sanity check that the two largely agree and that
+    orientation (the principled choice for retinal/steering error) is sound.
+
+    Generic to any FlyTracker dataset; pass an already-filtered df (e.g. moving
+    frames of one acquisition). Reads the base radian columns and converts to
+    degrees here.
+
+    NOTE: `theta_error_heading` is QC-only — it is not maintained or used in
+    downstream analyses, so the value stored in older processed parquets predates
+    fixes to the transform, and the heading derivation itself (smoothed
+    frame-to-frame position differencing) has not been validated for analysis
+    use. If you decide to rely on this column, recompute it fresh rather than
+    trusting the stored value (and consider revisiting how `heading` is
+    computed): `df['theta_error_heading'] = recompute_theta_error_heading(df)`.
+
+    Args:
+        df: df with `ori_col` and `heading_col` (radians if `in_degrees`).
+        ori_col, heading_col: column names.
+        in_degrees: convert radians -> degrees for display.
+        lim: axis limit (degrees) for the unity line / square aspect.
+        title: optional suptitle.
+
+    Returns:
+        (fig, r) — figure and Pearson correlation; (None, nan) if `heading_col`
+        is absent or there are no valid paired points.
+    """
+    if heading_col not in df.columns or ori_col not in df.columns:
+        print("plot_theta_error_ori_vs_heading: missing {!r}/{!r}; skipping.".format(
+            ori_col, heading_col))
+        return None, float('nan')
+
+    conv = np.rad2deg if in_degrees else (lambda x: x)
+    te_ori = conv(df[ori_col].values.astype(float))
+    te_hdg = conv(df[heading_col].values.astype(float))
+    valid = ~np.isnan(te_ori) & ~np.isnan(te_hdg)
+    if valid.sum() < 2:
+        print("plot_theta_error_ori_vs_heading: <2 valid points; skipping.")
+        return None, float('nan')
+    te_ori, te_hdg = te_ori[valid], te_hdg[valid]
+    r = float(np.corrcoef(te_ori, te_hdg)[0, 1])
+    unit = '°' if in_degrees else ' (rad)'
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+    ax = axes[0]
+    ax.scatter(te_ori, te_hdg, s=2, alpha=0.15, rasterized=rasterized)
+    ax.plot([-lim, lim], [-lim, lim], 'r--', lw=0.8, label='unity')
+    ax.set_xlabel('θ error from orientation{}'.format(unit))
+    ax.set_ylabel('θ error from heading{}'.format(unit))
+    ax.set_title('Correlation: r = {:.3f}'.format(r))
+    ax.set_aspect('equal')
+    ax.legend(fontsize=8)
+
+    ax = axes[1]
+    diff = te_ori - te_hdg
+    ax.hist(diff, bins=100, color='steelblue', edgecolor='none')
+    ax.axvline(0, color='r', ls='--', lw=0.8)
+    ax.set_xlabel('Orientation − Heading θ error{}'.format(unit))
+    ax.set_ylabel('Count')
+    ax.set_title('Difference (mean={:.1f}, std={:.1f})'.format(diff.mean(), diff.std()))
+
+    if title:
+        fig.suptitle(title)
+    plt.tight_layout()
+    return fig, r
 
 
 # ---------------------------------------------------------------------------

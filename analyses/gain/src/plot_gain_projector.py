@@ -444,7 +444,7 @@ stretch_targ = targ_df[(targ_df['frame'] >= f_start) & (targ_df['frame'] <= f_en
 print(f"Showing frames {f_start}-{f_end} ({(f_end-f_start)/fps:.1f}s)")
 
 # Precompute degree columns
-stretch['ang_vel_deg'] = -1 * np.rad2deg(stretch['ang_vel'])
+stretch['ang_vel_deg'] = np.rad2deg(stretch['ang_vel'])  # FT feat ang_vel is unsigned speed; no sign flip
 stretch['ori_deg'] = np.rad2deg(stretch['ori'])
 stretch['ang_vel_fly_deg'] = np.rad2deg(stretch['ang_vel_fly'])
 

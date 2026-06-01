@@ -749,7 +749,9 @@ def diagnostics_plot_timecourses(stretch, f_start, f_end, example_lag=6,
     if 'ang_vel_fly_deg' not in stretch.columns:
         stretch['ang_vel_fly_deg'] = np.rad2deg(stretch['ang_vel_fly'])
     if 'ang_vel_deg' not in stretch.columns:
-        stretch['ang_vel_deg'] = -1 * np.rad2deg(stretch['ang_vel'])
+        # FlyTracker's feat.mat `ang_vel` is an unsigned angular *speed* (>= 0);
+        # plot it as-is (no sign flip). Use `ang_vel_fly` for signed direction.
+        stretch['ang_vel_deg'] = np.rad2deg(stretch['ang_vel'])
     if 'ori_deg' not in stretch.columns:
         stretch['ori_deg'] = np.rad2deg(stretch['ori'])
 
@@ -810,7 +812,7 @@ def diagnostics_plot_timecourses_zoom(stretch, zoom_offset=1.0, zoom_dur=1.0,
     ax_vel.plot(zoom_sec, zoom['ang_vel_fly_deg'], '-o', color='deepskyblue',
                 lw=1, ms=3, label='ang_vel_fly')
     ax_vel.plot(zoom_sec, zoom['ang_vel_deg'], '-o', color='lime',
-                lw=1, ms=3, label='ang_vel (FT, sign-flipped)')
+                lw=1, ms=3, label='ang_vel (FT, |speed|)')
     ax_vel.axhline(0, color=bg_color, ls='--', lw=0.5)
     ax_vel.set_ylabel('Ang vel (deg/s)')
     ax_vel.set_xlabel('Time (s)')

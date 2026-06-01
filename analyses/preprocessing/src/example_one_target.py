@@ -175,7 +175,7 @@ f1.loc[flip_mask, ['ori', 'ang_vel_fly']] = np.nan
 # Convert some stuff to deg 
 f1['theta_error_deg'] = np.rad2deg(f1['theta_error'])
 f1['ang_vel_fly_deg'] = np.rad2deg(f1['ang_vel_fly'])
-f1['ang_vel_deg'] = -1 * np.rad2deg(f1['ang_vel'])
+f1['ang_vel_deg'] = np.rad2deg(f1['ang_vel'])  # FT feat ang_vel is unsigned speed; no sign flip
 f1['ori_deg'] = np.rad2deg(f1['ori'])
 f1['sec'] = f1['frame'] / fps
 
