@@ -200,46 +200,18 @@ print(f"Frames after ang_vel filter (<{max_ang_vel_deg} deg/s): {len(chasedf)}")
 # QC PLOT A: Heading vs. Orientation theta_error correlation
 # ============================================================
 #%%
+# Orientation-vs-heading theta_error comparison is a generic FlyTracker QC,
+# promoted to libs.qc.plot_theta_error_ori_vs_heading.
+# NOTE: theta_error_heading is QC-only and not maintained for analysis use; if
+# you ever rely on it, recompute it (qc.recompute_theta_error_heading) rather
+# than trusting the stored column.
 _example_acqs = f1['acquisition'].unique()
 if len(_example_acqs) > 0:
     _qc_acq = _example_acqs[0]
     _qc_data = f1[(f1['acquisition'] == _qc_acq) & (f1['vel'] > vel_lim)].copy()
-
-    _has_heading = 'theta_error_heading' in _qc_data.columns
-    if not _has_heading:
-        print(f"theta_error_heading not in columns — skipping heading QC plot.")
-    else:
-        _te_ori_deg = np.rad2deg(_qc_data['theta_error'])
-        _te_hdg_deg = np.rad2deg(_qc_data['theta_error_heading'])
-
-        _valid = _te_ori_deg.notna() & _te_hdg_deg.notna()
-        _r = np.corrcoef(_te_ori_deg[_valid], _te_hdg_deg[_valid])[0, 1]
-
-        fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-
-        ax = axes[0]
-        ax.scatter(_te_ori_deg[_valid], _te_hdg_deg[_valid], s=2, alpha=0.15,
-                   rasterized=True)
-        lims = [-deg_lim, deg_lim]
-        ax.plot(lims, lims, 'r--', lw=0.8, label='unity')
-        ax.set_xlabel('θ error from orientation (°)')
-        ax.set_ylabel('θ error from heading (°)')
-        ax.set_title(f'Correlation: r = {_r:.3f}')
-        ax.set_aspect('equal')
-        ax.legend(fontsize=8)
-
-        ax = axes[1]
-        _diff = _te_ori_deg[_valid] - _te_hdg_deg[_valid]
-        ax.hist(_diff, bins=100, color='steelblue', edgecolor='none')
-        ax.axvline(0, color='r', ls='--', lw=0.8)
-        ax.set_xlabel('Orientation – Heading θ error (°)')
-        ax.set_ylabel('Count')
-        ax.set_title(f'Difference distribution (mean={_diff.mean():.1f}°, '
-                     f'std={_diff.std():.1f}°)')
-
-        fig.suptitle(f'θ error: Orientation vs Heading — {_qc_acq}',
-                     fontsize=MIN_FONTSIZE + 1)
-        plt.tight_layout()
+    fig, _r = qc.plot_theta_error_ori_vs_heading(
+        _qc_data, lim=deg_lim, title=f'θ error: Orientation vs Heading — {_qc_acq}')
+    if fig is not None:
         putil.label_figure(fig, figid)
         figname = 'qc_theta_error_ori_vs_heading'
         plt.savefig(os.path.join(figdir, f'{figname}.png'), dpi=150,
