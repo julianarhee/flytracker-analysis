@@ -25,9 +25,8 @@ import libs.utils as util
 import cv2
 import importlib
 
-#from relative_metrics import get_video_cap, do_transformations_on_df
-import relative_metrics as rem
-import plot_dlc_frames as pdlc
+import transform_data.relative_metrics as rem
+import analyses.dlc.src.plot_dlc_frames as pdlc
 
 plot_style='white'
 putil.set_sns_style(style=plot_style)
