@@ -268,27 +268,49 @@ def get_copulation_frames(action_fpath):
 # ---------------------------------------------------------------------------
 # JAABA automated scores
 # ---------------------------------------------------------------------------
+def _stack_ragged_scores(per_fly, tstart):
+    """Stack per-fly JAABA score arrays into a (frames, n_flies) array.
+
+    Per-fly arrays can have *different* lengths: a fly whose track ends early
+    (tracking lost) has a shorter score vector. Each fly's scores cover frames
+    `[tStart_i - 1, tStart_i - 1 + len_i)` (tStart is 1-indexed); we place them
+    at that offset in a NaN-padded common-length array. When all flies share the
+    same length and tStart==1 this reduces to the old `np.vstack(...).T`.
+    """
+    arrs = [np.asarray(f, dtype=float).ravel() for f in per_fly]
+    tstart = np.asarray(tstart).ravel().astype(int)
+    starts = [int(tstart[i]) - 1 if i < len(tstart) else 0
+              for i in range(len(arrs))]
+    max_len = max((s + a.shape[0] for s, a in zip(starts, arrs)), default=0)
+    out = np.full((len(arrs), max_len), np.nan)
+    for i, (s, a) in enumerate(zip(starts, arrs)):
+        out[i, s:s + a.shape[0]] = a
+    return out.T
+
+
 def load_jaaba_from_mat(mat_fpath, return_dict=False):
     """Load a JAABA `scores_*.mat` file.
 
-    Adapted from `analyses/multichamber/src/multichamber_strains.py`.
+    Adapted from `analyses/multichamber/src/multichamber_strains.py`, but
+    tolerant of *ragged* per-fly score arrays (flies whose tracks end early have
+    shorter score vectors) — these are NaN-padded to a common length aligned by
+    `tStart`, rather than failing the old equal-length `np.vstack`.
 
     Returns:
         pd.DataFrame (frames x fly_ids) of raw scores, or the full allScores
-        dict if `return_dict=True`. Returns None if scores can't be stacked.
+        dict if `return_dict=True`.
     """
     mat = scipy.io.loadmat(mat_fpath)
     allscores_data = mat['allScores'][0][0]
     fields = ['scores', 'tStart', 'tEnd', 'postprocessed', 'postprocessparams',
               't0s', 't1s', 'scoreNorm']
+    raw = dict(zip(fields, allscores_data))
+    tstart = raw['tStart']  # 1-indexed per-fly start frame; raveled in helper
     allscores = {}
-    for k, v in zip(fields, allscores_data):
-        if k in ['scores', 'postprocessed']:
-            try:
-                allscores[k] = np.vstack(v[0]).T
-            except ValueError:
-                print("Error stacking JAABA scores: {}".format(mat_fpath))
-                return None
+    for k in fields:
+        v = raw[k]
+        if k in ('scores', 'postprocessed'):
+            allscores[k] = _stack_ragged_scores(v[0], tstart)
         else:
             allscores[k] = v[0]
     if return_dict:
@@ -346,3 +368,232 @@ def add_jaaba_scores(df, acqdir, beh_types=('chasing', 'unilateral_extension'),
         df = df.merge(stacked, how='left', on=['frame', 'id'])
         df['{}_binary'.format(col)] = df[col].ge(thresholds.get(beh, 0.0))
     return df, missing
+
+
+# ---------------------------------------------------------------------------
+# Derived courtship labels (analysis-time, tunable)
+# ---------------------------------------------------------------------------
+# Distinct from the *imported* labels above (manual -actions via
+# assign_action_frames_to_df, JAABA via add_jaaba_scores): these are derived
+# from kinematics/geometry at analysis time, with tunable thresholds, so they
+# can be re-computed off the processed parquet without re-running the pipeline.
+#
+# derive_courtship_labels() writes SOURCE-AGNOSTIC canonical columns
+# `is_<behavior>` (0/1) so downstream metrics never need to know whether a label
+# came from JAABA, manual annotation, or a kinematic gate. 'singing' == the
+# unilateral wing-extension behavior.
+CANONICAL_BEHAVIORS = ['orienting', 'chasing', 'singing']
+
+# Which processed-parquet column backs each canonical behavior, per source.
+# ('orienting' is always derived from facing_angle and has no source column.)
+_LABEL_SOURCE_COLUMNS = {
+    'jaaba': {
+        'chasing': 'jaaba_chasing_binary',
+        'singing': 'jaaba_unilateral_extension_binary',
+    },
+    'manual': {
+        'chasing': 'chasing',                 # manual -actions binary column
+        'singing': 'unilateral_extension',    # manual -actions binary column
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Subset / dataset-discovery helpers
+# ---------------------------------------------------------------------------
+def list_acquisitions_by_strain(rootdir, species_list=None):
+    """Map every available acquisition to its strain for each species.
+
+    Reads the per-species metadata CSV (from `load_strain_metadata`) and
+    cross-references it against the acquisition directories that actually exist
+    on disk.  Acquisitions in the metadata but absent from disk are silently
+    skipped (they will be logged when processing is attempted).
+
+    Args:
+        rootdir (str): data root (same value as `ROOTDIR`).
+        species_list (list or None): which species to query; defaults to all in
+            `SPECIES_DIRS` ({'Dmel', 'Dyak'}).
+
+    Returns:
+        dict: ``{species: {strain: [acq_name, ...]}}`` sorted alphabetically.
+    """
+    if species_list is None:
+        species_list = list(SPECIES_DIRS.keys())
+    result = {}
+    for sp in species_list:
+        species_dir = os.path.join(rootdir, SPECIES_DIRS[sp])
+        if not os.path.isdir(species_dir):
+            continue
+        try:
+            meta = load_strain_metadata(species_dir)
+        except (AssertionError, FileNotFoundError):
+            continue
+        # Acquisitions on disk
+        on_disk = set(
+            f for f in os.listdir(species_dir)
+            if f.startswith('20') and os.path.isdir(os.path.join(species_dir, f))
+        )
+        strain_map = {}
+        for acq in sorted(meta['acquisition'].unique()):
+            if acq not in on_disk:
+                continue
+            strain_rows = meta[meta['acquisition'] == acq]['strain_male']
+            if strain_rows.empty or strain_rows.dropna().empty:
+                continue
+            strain = str(strain_rows.dropna().iloc[0])
+            strain_map.setdefault(strain, []).append(acq)
+        result[sp] = {k: sorted(v) for k, v in sorted(strain_map.items())}
+    return result
+
+
+def select_subset_acquisitions(rootdir, n_strains_per_species=4,
+                               n_acqs_per_strain=4, species_list=None,
+                               strains_to_exclude=None, seed=None):
+    """Auto-select a reproducible subset of acquisitions for pilot analysis.
+
+    Chooses the `n_strains_per_species` strains with the most available
+    acquisitions (ties broken alphabetically), then picks the first
+    `n_acqs_per_strain` acquisition folders from each strain (sorted
+    alphabetically → fully reproducible without a random seed).
+
+    Pass `seed` to shuffle within each strain before picking (useful for
+    leaving-out a hold-out set).
+
+    Args:
+        rootdir (str): data root.
+        n_strains_per_species (int): strains to include per species.
+        n_acqs_per_strain (int): acquisitions to include per strain.
+        species_list (list or None): species to query; defaults to all.
+        strains_to_exclude (set or None): strain names to skip.
+        seed (int or None): shuffle seed; None = alphabetical order.
+
+    Returns:
+        dict: ``{species: {strain: [acq_name, ...]}}`` — the subset selection.
+    """
+    available = list_acquisitions_by_strain(rootdir, species_list=species_list)
+    exclude = set(strains_to_exclude or [])
+    subset = {}
+    rng = np.random.default_rng(seed) if seed is not None else None
+
+    for sp, strain_map in available.items():
+        # Strains with enough acquisitions, sorted by count desc then name asc
+        eligible = {s: acqs for s, acqs in strain_map.items()
+                    if s not in exclude and len(acqs) > 0}
+        chosen_strains = sorted(
+            eligible.keys(),
+            key=lambda s: (-len(eligible[s]), s)
+        )[:n_strains_per_species]
+
+        sp_subset = {}
+        for strain in chosen_strains:
+            acqs = list(eligible[strain])
+            if rng is not None:
+                rng.shuffle(acqs)
+            sp_subset[strain] = acqs[:n_acqs_per_strain]
+        subset[sp] = sp_subset
+    return subset
+
+
+def print_subset_summary(subset):
+    """Pretty-print a subset dict to stdout for easy inspection."""
+    for sp, strain_map in sorted(subset.items()):
+        print('\n{} ({} strains):'.format(sp, len(strain_map)))
+        for strain, acqs in sorted(strain_map.items()):
+            print('  {:20s}  {} acqs'.format(strain, len(acqs)))
+            for a in acqs:
+                print('    {}'.format(a))
+
+
+def filter_chasing(df, use_jaaba=True, beh_type='jaaba_chasing_binary',
+                   min_vel=10, max_facing_angle=np.deg2rad(90),
+                   max_dist_to_other=20,
+                   max_targ_pos_theta=np.deg2rad(270),
+                   min_targ_pos_theta=np.deg2rad(-270),
+                   min_wing_ang=np.deg2rad(45)):
+    """Select male frames of a chasing/singing-like behavior.
+
+    Two modes (ported from
+    `analyses/multichamber/src/multichamber_strains.py:filter_chasing`):
+
+    - `use_jaaba=True`: rows where the JAABA/manual binary column `beh_type` is
+      set (plus a facing-angle gate, and a wing-angle gate for singing).
+    - `use_jaaba=False`: a purely kinematic gate on velocity, facing angle,
+      target position angle, wing angle and interfly distance.
+
+    Returns the filtered sub-DataFrame (the caller maps `.index` back to a
+    binary column).
+    """
+    if use_jaaba:
+        sel = (df[beh_type] == True) & (df['sex'] == 'm') \
+            & (df['facing_angle'] <= max_facing_angle)
+        if 'singing' in beh_type or 'unilateral' in beh_type:
+            sel = sel & (df['max_wing_ang'] >= min_wing_ang)
+        return df[sel].copy()
+
+    sel = (df['sex'] == 'm') \
+        & (df['vel'] >= min_vel) \
+        & (df['targ_pos_theta'] <= max_targ_pos_theta) \
+        & (df['targ_pos_theta'] >= min_targ_pos_theta) \
+        & (df['facing_angle'] <= max_facing_angle) \
+        & (df['max_wing_ang'] >= min_wing_ang) \
+        & (df['dist_to_other'] <= max_dist_to_other)
+    return df[sel].copy()
+
+
+def derive_courtship_labels(df, source='jaaba', orienting_angle_deg=10,
+                            chasing_kws=None, singing_kws=None):
+    """Add canonical per-frame courtship labels to a processed parquet df.
+
+    Adds integer 0/1 columns `is_orienting`, `is_chasing`, `is_singing`, a
+    `courtship_sum` (their sum) and `is_courting` (sum > 0). Operates on a copy.
+
+    Args:
+        df (pd.DataFrame): processed-parquet df (one or many acquisitions).
+        source (str): where chasing/singing come from:
+            - 'jaaba'    : JAABA binary columns (`jaaba_*_binary`)
+            - 'manual'   : manual -actions binary columns
+            - 'kinematic': recomputed from kinematics via `filter_chasing`
+        orienting_angle_deg (float): facing-angle threshold (deg) for orienting.
+        chasing_kws, singing_kws (dict): only used when source='kinematic';
+            passed to `filter_chasing(use_jaaba=False, ...)`.
+
+    Returns:
+        pd.DataFrame: copy of df with the canonical label columns added.
+    """
+    df = df.copy()
+
+    # Orienting is always geometric (facing the target), regardless of source.
+    df['is_orienting'] = (df['facing_angle'] <= np.deg2rad(orienting_angle_deg)).astype(int)
+
+    if source in ('jaaba', 'manual'):
+        colmap = _LABEL_SOURCE_COLUMNS[source]
+        for beh, col in colmap.items():
+            if col not in df.columns:
+                raise KeyError(
+                    "source='{}' needs column '{}' for '{}'; available label "
+                    "columns: {}".format(source, col, beh,
+                        [c for c in df.columns if 'chasing' in c or 'singing' in c
+                         or 'unilateral' in c]))
+            df['is_{}'.format(beh)] = df[col].fillna(False).astype(int)
+    elif source == 'kinematic':
+        # Chasing: target ahead within 60deg, moving, close; NO wing gate
+        # (chasing doesn't require wing extension). Singing: wing extended,
+        # target ahead, any speed, slightly wider distance.
+        chasing_kws = chasing_kws or dict(min_vel=10, max_facing_angle=np.deg2rad(60),
+                                          min_wing_ang=0, max_dist_to_other=20)
+        singing_kws = singing_kws or dict(min_vel=0, min_wing_ang=np.deg2rad(30),
+                                          max_dist_to_other=35,
+                                          max_facing_angle=np.deg2rad(90))
+        chasedf = filter_chasing(df, use_jaaba=False, **chasing_kws)
+        singdf = filter_chasing(df, use_jaaba=False, **singing_kws)
+        df['is_chasing'] = 0
+        df.loc[chasedf.index, 'is_chasing'] = 1
+        df['is_singing'] = 0
+        df.loc[singdf.index, 'is_singing'] = 1
+    else:
+        raise ValueError("source must be 'jaaba', 'manual' or 'kinematic', "
+                         "got {!r}".format(source))
+
+    df['courtship_sum'] = df[['is_{}'.format(b) for b in CANONICAL_BEHAVIORS]].sum(axis=1)
+    df['is_courting'] = (df['courtship_sum'] > 0).astype(int)
+    return df

@@ -33,6 +33,7 @@ import sys
 import glob
 import argparse
 import traceback
+import multiprocessing
 
 import numpy as np
 import pandas as pd
@@ -231,14 +232,59 @@ def process_single_acquisition(acqdir, meta, species=None, fps=60, array_size='2
 # ---------------------------------------------------------------------------
 # Batch / aggregation
 # ---------------------------------------------------------------------------
+
+# ── Parallel worker ──────────────────────────────────────────────────────────
+# Must be a top-level function (not a closure) so multiprocessing can pickle it
+# under the 'spawn' start method that macOS uses by default.
+
+def _process_acq_worker(task):
+    """Worker called by multiprocessing.Pool for one acquisition.
+
+    Saves the per-acquisition parquet and returns its path (or None on failure).
+    Callers collect the paths and load them in the main process.
+    """
+    (acqdir, out_fpath, meta, species, fps, array_size, ori_method, create_new) = task
+    acq = os.path.basename(acqdir.rstrip('/'))
+
+    if os.path.exists(out_fpath) and not create_new:
+        print("[{}] cached".format(acq), flush=True)
+        return out_fpath
+
+    acq_df = process_single_acquisition(
+        acqdir, meta, species=species, fps=fps, array_size=array_size,
+        ori_method=ori_method)
+    if acq_df is None:
+        return None
+
+    acq_df.to_parquet(out_fpath, engine='pyarrow', compression='snappy')
+    print("[{}] saved ({} rows) -> {}".format(acq, len(acq_df), out_fpath), flush=True)
+    return out_fpath
+
+
 def process_species(species, rootdir=sf.ROOTDIR, fps=60, array_size='2x2',
-                    create_new=False, acqs=None, save_each=True, ori_method='velocity'):
+                    create_new=False, acqs=None, save_each=True,
+                    ori_method='velocity', n_workers=1):
     """Process every acquisition for one species and return the aggregate df.
 
     Per-acquisition parquet files are written to <rootdir>/2x2_strains_processed/
     processed/<acq>.parquet (skipped if present unless `create_new`).
-    `ori_method` selects the orientation-polarity handling; see
-    `process_single_acquisition`.
+
+    NOTE — species split assumption: each acquisition is assumed to come from a
+    single-species directory (sf.SPECIES_DIRS).  Per-pair species assignment is
+    handled by assign_strain_to_multichamber via the `species_male` column in the
+    metadata CSV when present; `dataset_species` records the directory-level
+    species.  If a future acquisition genuinely mixes Dmel and Dyak pairs, put it
+    in a separate directory with a metadata CSV that has a `species_male` column
+    and add an entry to sf.SPECIES_DIRS, or call process_single_acquisition
+    directly with a combined metadata table.
+
+    Args:
+        n_workers (int): number of parallel worker processes.  1 = serial
+            (default, original behaviour).  Set to 0 to use all CPU cores.
+            Values > 1 run acquisitions in parallel via multiprocessing.Pool;
+            each worker saves its parquet and returns the path, then the main
+            process loads them all.  The external-drive I/O bottleneck means
+            4-6 workers is usually optimal for spinning-disk / USB drives.
     """
     species_dir = os.path.join(rootdir, sf.SPECIES_DIRS[species])
     meta = sf.load_strain_metadata(species_dir)
@@ -247,25 +293,60 @@ def process_species(species, rootdir=sf.ROOTDIR, fps=60, array_size='2x2',
     if acqs is None:
         acqs = list_acquisitions(species_dir)
 
-    d_list = []
-    for acq in acqs:
-        acqdir = os.path.join(species_dir, acq)
-        out_fpath = os.path.join(procdir, '{}.parquet'.format(acq))
-        if os.path.exists(out_fpath) and not create_new:
-            print("[{}] cached; loading".format(acq))
-            d_list.append(pd.read_parquet(out_fpath))
-            continue
-        acq_df = process_single_acquisition(
-            acqdir, meta, species=species, fps=fps, array_size=array_size,
-            ori_method=ori_method)
-        if acq_df is None:
-            continue
-        if save_each:
-            acq_df.to_parquet(out_fpath, engine='pyarrow', compression='snappy')
-        d_list.append(acq_df)
+    tasks = [
+        (os.path.join(species_dir, acq),
+         os.path.join(procdir, '{}.parquet'.format(acq)),
+         meta, species, fps, array_size, ori_method, create_new)
+        for acq in acqs
+    ]
 
-    if not d_list:
+    if n_workers != 1:
+        n_cpu = multiprocessing.cpu_count()
+        n_workers = n_cpu if n_workers == 0 else min(n_workers, n_cpu)
+        n_workers = min(n_workers, len(tasks))
+        print("Parallel: {} acquisitions on {} workers".format(len(tasks), n_workers),
+              flush=True)
+        # Use 'spawn' explicitly (macOS default; avoids fork-related crashes with
+        # numpy / OpenCV / matplotlib loaded in the parent).
+        ctx = multiprocessing.get_context('spawn')
+        paths = []
+        with ctx.Pool(n_workers) as pool:
+            for i, path in enumerate(
+                    pool.imap_unordered(_process_acq_worker, tasks), 1):
+                paths.append(path)
+                print("[{}/{}] done".format(i, len(tasks)), flush=True)
+    else:
+        # Serial path — original behaviour; keeps in-memory df when save_each=False.
+        d_list = []
+        for i, (task, acq) in enumerate(zip(tasks, acqs), 1):
+            print("\n[{}/{}] Processing: {}".format(i, len(acqs), acq), flush=True)
+            acqdir, out_fpath = task[0], task[1]
+            if os.path.exists(out_fpath) and not create_new:
+                print("[{}] cached; loading".format(acq))
+                d_list.append(pd.read_parquet(out_fpath))
+                continue
+            acq_df = process_single_acquisition(
+                acqdir, meta, species=species, fps=fps, array_size=array_size,
+                ori_method=ori_method)
+            if acq_df is None:
+                continue
+            if save_each:
+                print("[{}] saving parquet ({} rows)...".format(acq, len(acq_df)),
+                      flush=True)
+                acq_df.to_parquet(out_fpath, engine='pyarrow', compression='snappy')
+                print("[{}] saved -> {}".format(acq, out_fpath))
+            d_list.append(acq_df)
+        if not d_list:
+            return pd.DataFrame()
+        df0 = pd.concat(d_list, ignore_index=True)
+        df0 = assign_global_id(df0)
+        return df0
+
+    # Parallel path: load all saved parquets in the main process.
+    paths = [p for p in paths if p is not None and os.path.exists(p)]
+    if not paths:
         return pd.DataFrame()
+    d_list = [pd.read_parquet(p) for p in sorted(paths)]
     df0 = pd.concat(d_list, ignore_index=True)
     df0 = assign_global_id(df0)
     return df0
@@ -274,23 +355,21 @@ def process_species(species, rootdir=sf.ROOTDIR, fps=60, array_size='2x2',
 def assign_global_id(df0):
     """Assign a unique `global_id` across acquisitions (per acquisition+id)."""
     df0 = df0.copy()
-    df0['global_id'] = -1
-    curr = 0
-    for (_, _), idx in df0.groupby(['acquisition', 'id']).groups.items():
-        df0.loc[idx, 'global_id'] = curr
-        curr += 1
+    df0['global_id'] = df0.groupby(['acquisition', 'id'], sort=True).ngroup()
     return df0
 
 
 def aggregate_and_save(species_list, rootdir=sf.ROOTDIR, fps=60, array_size='2x2',
-                       create_new=False, acqs=None, ori_method='velocity'):
+                       create_new=False, acqs=None, ori_method='velocity',
+                       n_workers=1):
     """Process the requested species and save per-species + combined parquet."""
     _, aggdir = get_output_dirs(rootdir)
     per_species = {}
     for sp in species_list:
         print("\n=== Processing species: {} ===".format(sp))
         df_sp = process_species(sp, rootdir=rootdir, fps=fps, array_size=array_size,
-                                create_new=create_new, acqs=acqs, ori_method=ori_method)
+                                create_new=create_new, acqs=acqs, ori_method=ori_method,
+                                n_workers=n_workers)
         if df_sp.empty:
             print("=== {}: no data ===".format(sp))
             continue
@@ -331,6 +410,10 @@ if __name__ == '__main__':
                              "'wing' (NaN ori where wings undetected; no motion assumption), "
                              "'none' (raw FlyTracker ori). Use 'wing'/'none' for assays with "
                              "substantial sideways/backward motion.")
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of parallel worker processes (default: 1 = serial). '
+                             'Set to 0 to use all CPU cores. Recommended: 4-6 for '
+                             'external/USB drives, up to cpu_count() for local SSD.')
     args = parser.parse_args()
 
     species_list = ['Dmel', 'Dyak'] if args.species == 'both' else [args.species]
@@ -339,8 +422,8 @@ if __name__ == '__main__':
         assert args.species in ('Dmel', 'Dyak'), '--single requires --species Dmel or Dyak'
         aggregate_and_save(species_list, rootdir=args.rootdir, fps=args.fps,
                            array_size=args.array, create_new=True, acqs=[args.single],
-                           ori_method=args.ori_method)
+                           ori_method=args.ori_method, n_workers=1)
     else:
         aggregate_and_save(species_list, rootdir=args.rootdir, fps=args.fps,
                            array_size=args.array, create_new=args.new,
-                           ori_method=args.ori_method)
+                           ori_method=args.ori_method, n_workers=args.workers)
